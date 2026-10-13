@@ -60,14 +60,93 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+# Per-hour spot preemption probability by GPU type — illustrative 2026 snapshot.
+# Flagship training parts (H100/H200) sit in large, deep pools and are reclaimed
+# less often; small inference parts (A10G/L4) are oversubscribed and churn more.
+SPOT_INTERRUPT_RATE = {
+    "H100": 0.03, "H200": 0.03, "B200": 0.04, "A100": 0.05,
+    "MI300X": 0.06, "A10G": 0.08, "L4": 0.08,
+}
+DEFAULT_SPOT_INTERRUPT_RATE = 0.05
+
+
+def reserved_effective_hr(rate_hr: float, term_months: int, horizon_months: float) -> float:
+    """Effective $/hr of a commitment when you only need it for `horizon_months`.
+
+    A reservation is billed for its whole term whether you use it or not, so a
+    3yr commitment for a service that lives 12 months costs 3x its sticker rate.
+    """
+    used = min(float(term_months), max(0.0, horizon_months))
+    return rate_hr * term_months / used if used > 0 else float("inf")
+
+
+def tier_costs(
+    hours_per_day: float,
+    interruptible: bool,
+    prices: dict,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+    horizon_months: float = 36,
+    num_gpus: int = 1,
+    days: int = 30,
+    spot_interrupt_rate: float | None = None,
+) -> dict:
+    """Monthly cost of every *eligible* tier for one workload.
+
+    - on_demand : pay only for the hours you run.
+    - spot      : only if interruptible; priced with the checkpoint/rework sim at
+                  the GPU type's preemption rate.
+    - reserved  : only if the workload is persistent (job_days >= 30 or unknown);
+                  billed 24h/day (the commitment does not pause when you idle) at
+                  the horizon-amortized 1yr / 3yr rate.
+    """
+    hpd = max(0.0, min(24.0, hours_per_day))
+    run_hours = hpd * days * num_gpus
+    commit_hours = 24.0 * days * num_gpus
+    od = float(prices["on_demand_hr"])
+    costs = {"on_demand": run_hours * od}
+    if interruptible and run_hours > 0:
+        rate = spot_interrupt_rate
+        if rate is None:
+            rate = SPOT_INTERRUPT_RATE.get(gpu_type, DEFAULT_SPOT_INTERRUPT_RATE)
+        sim = spot_checkpoint_cost(run_hours, float(prices["spot_hr"]), od, interrupt_rate=rate)
+        costs["spot"] = sim["spot_cost"]
+    if job_days is None or job_days >= 30:
+        for term, key in ((12, "reserved_1yr_hr"), (36, "reserved_3yr_hr")):
+            if key in prices:
+                eff = reserved_effective_hr(float(prices[key]), term, horizon_months)
+                costs[f"reserved_{term // 12}yr"] = commit_hours * eff
+    return costs
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+    prices: dict | None = None,
+    horizon_months: float = 36,
+    spot_interrupt_rate: float | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
+    Without `prices` this is the DOCUMENTED simple policy (v1):
       - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
       - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
       - otherwise                 -> 'on_demand' (spiky / low duty)
+
+    With a catalog row in `prices` it is the cost-based policy (v2): price every
+    eligible tier via `tier_costs` (per-GPU spot interruption rate, 24h/day
+    reserved billing, 1yr vs 3yr amortized over `horizon_months`) and return the
+    cheapest — 'on_demand', 'spot', 'reserved_1yr' or 'reserved_3yr'. Ties go to
+    on_demand, which keeps the option to walk away.
     """
+    if prices is not None:
+        costs = tier_costs(hours_per_day, interruptible, prices, gpu_type=gpu_type,
+                           job_days=job_days, horizon_months=horizon_months,
+                           spot_interrupt_rate=spot_interrupt_rate)
+        return min(costs, key=costs.get)
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
     if interruptible and hours_per_day < 24:
