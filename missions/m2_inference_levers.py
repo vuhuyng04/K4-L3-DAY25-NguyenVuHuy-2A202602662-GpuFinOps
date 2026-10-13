@@ -4,13 +4,15 @@ Run: python missions/m2_inference_levers.py
 
 Your Turn #3: prompt caching is only applied where `cache_is_worth_it()` says the
 re-read rate beats the cache-write cost.
+Your Turn #4: reasoning budget — $ and Wh of is_reasoning traffic, and what a
+traffic cap on reasoning would save.
 """
 from __future__ import annotations
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from collections import defaultdict
 from missions._common import load_csv, num
-from finops import pricing
+from finops import pricing, sustainability
 
 # $/1M tokens (input, output) — illustrative 2026.
 MODEL_PRICES = {"small": (0.20, 0.40), "large": (3.00, 15.00)}
@@ -18,6 +20,8 @@ WRITE_PREMIUM = pricing.CACHE_WRITE_PREMIUM   # Anthropic-style cache pricing
 # Gemini-style alternative: flat storage fee per cached token-hour.
 STORAGE_USD_PER_M_HR = 1.00
 CACHE_TTL_HR = 1.0
+REASONING_OUTPUT_TAX = 6          # generator: reasoning multiplies output tokens ~6x
+REASONING_CAPS = (0.10, 0.05, 0.02, 0.0)
 
 
 def _parse(r) -> dict:
@@ -62,6 +66,50 @@ def request_cost(p, cascade=True, cache_teams=(), batch=True, write_premium=WRIT
                                 write_premium=write_premium if cache_on else 0.0)
 
 
+def _wh(p) -> float:
+    return sustainability.wh_per_query(p["inp"] + p["out"], is_reasoning=p["reasoning"])
+
+
+def reasoning_budget(rows, cache_teams, caps=REASONING_CAPS) -> dict:
+    """Split optimized $ and Wh by is_reasoning, then simulate reasoning traffic caps.
+
+    Under a cap of c x traffic, the reasoning requests with the longest outputs
+    (proxy for the hardest tasks) keep reasoning; the rest are demoted to a normal
+    answer: is_reasoning=0 and output / REASONING_OUTPUT_TAX.
+    """
+    split = {}
+    for flag in (True, False):
+        sub = [p for p in rows if p["reasoning"] == flag]
+        split["reasoning" if flag else "standard"] = {
+            "requests": len(sub),
+            "cost": sum(request_cost(p, cache_teams=cache_teams) for p in sub),
+            "wh": sum(_wh(p) for p in sub),
+        }
+    tot = {k: sum(v[k] for v in split.values()) for k in ("requests", "cost", "wh")}
+    for v in split.values():
+        v["share_traffic"] = v["requests"] / tot["requests"]
+        v["share_cost"] = v["cost"] / tot["cost"]
+        v["share_wh"] = v["wh"] / tot["wh"]
+        v["wh_per_query"] = v["wh"] / v["requests"] if v["requests"] else 0.0
+    std, rsn = split["standard"], split["reasoning"]
+    ratio = rsn["wh_per_query"] / std["wh_per_query"] if std["wh_per_query"] else 0.0
+
+    hard_first = sorted((p for p in rows if p["reasoning"]), key=lambda p: -p["out"])
+    scenarios = []
+    for cap in caps:
+        keep = int(cap * len(rows))
+        demoted = [dict(p, reasoning=False, out=p["out"] // REASONING_OUTPUT_TAX) for p in hard_first[keep:]]
+        cost = std["cost"] + sum(request_cost(p, cache_teams=cache_teams) for p in hard_first[:keep])             + sum(request_cost(p, cache_teams=cache_teams) for p in demoted)
+        wh = std["wh"] + sum(_wh(p) for p in hard_first[:keep]) + sum(_wh(p) for p in demoted)
+        scenarios.append({"cap": cap, "reasoning_requests": min(keep, len(hard_first)),
+                          "binding": keep < len(hard_first),
+                          "cost": cost, "wh": wh,
+                          "saved_usd_day": tot["cost"] - cost, "saved_wh_day": tot["wh"] - wh})
+    min_kept_out = hard_first[max(0, int(0.05 * len(rows)) - 1)]["out"] if hard_first else 0
+    return {"split": split, "total": tot, "wh_ratio": ratio, "scenarios": scenarios,
+            "cap5_min_output": min_kept_out}
+
+
 def run(verbose: bool = True) -> dict:
     rows = [_parse(r) for r in load_csv("token_usage.csv")]
     total_tokens = sum(p["inp"] + p["out"] for p in rows)
@@ -84,6 +132,8 @@ def run(verbose: bool = True) -> dict:
               for s, c in ladder]
     naive_cache = total(cascade=True, cache_teams=all_teams, batch=True, write_premium=0.0)
     cache_all = total(cascade=True, cache_teams=all_teams, batch=True)
+
+    budget = reasoning_budget(rows, cache_teams)
 
     base_pm = pricing.dollars_per_million(base_cost, total_tokens)
     opt_pm = pricing.dollars_per_million(opt_cost, total_tokens)
@@ -111,12 +161,25 @@ def run(verbose: bool = True) -> dict:
         print(f"cache ON for every team (pays write premium): ${cache_all:.2f}/day vs gated ${opt_cost:.2f}/day")
         print(f"original M2 accounting (cache everywhere, writes free): ${naive_cache:.2f}/day")
 
+        print("\n-- Reasoning budget (Your Turn #4) --")
+        print(f"{'traffic':10}{'requests':>9}{'% traffic':>10}{'$/day':>8}{'% cost':>8}{'Wh/day':>9}{'% Wh':>7}{'Wh/query':>10}")
+        for k, v in budget["split"].items():
+            print(f"{k:10}{v['requests']:>9}{v['share_traffic']:>10.1%}{v['cost']:>8.2f}{v['share_cost']:>8.1%}"
+                  f"{v['wh']:>9.0f}{v['share_wh']:>7.1%}{v['wh_per_query']:>10.2f}")
+        print(f"a reasoning query uses {budget['wh_ratio']:.0f}x the energy of a standard one")
+        print("cap reasoning to x% of traffic (longest outputs keep reasoning):")
+        for sc in budget["scenarios"]:
+            note = "" if sc["binding"] else "  (not binding: already below cap)"
+            print(f"  cap {sc['cap']:>4.0%}: save ${sc['saved_usd_day']:.2f}/day (${sc['saved_usd_day']*30:.0f}/mo), "
+                  f"{sc['saved_wh_day']/1000:.1f} kWh/day ({sc['saved_wh_day']*30/1000:.0f} kWh/mo){note}")
+
     return {
         "baseline_daily": round(base_cost, 2), "optimized_daily": round(opt_cost, 2),
         "baseline_per_m": round(base_pm, 3), "optimized_per_m": round(opt_pm, 3),
         "savings_pct": round(savings_pct, 1), "total_tokens": total_tokens,
         "ladder": ladder, "cache": econ,
         "cache_all_daily": round(cache_all, 2), "naive_cache_daily": round(naive_cache, 2),
+        "reasoning": budget,
     }
 
 
