@@ -180,6 +180,7 @@ def run(verbose: bool = True) -> dict:
         "ladder": ladder, "cache": econ,
         "cache_all_daily": round(cache_all, 2), "naive_cache_daily": round(naive_cache, 2),
         "reasoning": budget,
+        "small_share": sum(p["tier"] == "small" for p in rows) / len(rows),
     }
 
 

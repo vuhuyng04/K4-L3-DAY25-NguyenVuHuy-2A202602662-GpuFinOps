@@ -94,7 +94,7 @@ def run(verbose: bool = True) -> dict:
         mfu = metrics.compute_mfu(num(r["achieved_tflops"]), peak_fp16)
         mbu = metrics.compute_mbu(num(r["achieved_bw_tbs"]), peak_bw)
         a = agg[r["gpu_id"]]
-        a["type"] = gtype
+        a["type"], a["workload"] = gtype, r["workload"]
         a["util"].append(num(r["gpu_util_pct"]))
         a["mfu"].append(mfu)
         a["mbu"].append(mbu)
@@ -104,7 +104,7 @@ def run(verbose: bool = True) -> dict:
     summary = []
     for gid, a in agg.items():
         summary.append({
-            "gpu_id": gid, "gpu_type": a["type"],
+            "gpu_id": gid, "gpu_type": a["type"], "workload": a["workload"],
             "gpu_util_pct": round(sum(a["util"]) / len(a["util"]), 1),
             "mfu": round(sum(a["mfu"]) / len(a["mfu"]), 3),
             "mbu": round(sum(a["mbu"]) / len(a["mbu"]), 3),
