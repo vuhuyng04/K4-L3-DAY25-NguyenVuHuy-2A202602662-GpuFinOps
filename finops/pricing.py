@@ -15,12 +15,17 @@ def request_cost(
     cache_discount: float = 0.10,   # Anthropic cached-read ~0.1x (=-90%)
     batch: bool = False,
     batch_discount: float = 0.50,   # Batch API ~ -50%
+    write_premium: float = 0.0,     # cache-write surcharge on uncached input (Anthropic 5-min: 0.25)
 ) -> float:
-    """USD cost of a single request. Cached input billed at cache_discount x price."""
+    """USD cost of a single request. Cached input billed at cache_discount x price.
+
+    With caching enabled, every uncached input token is also written to the cache
+    and billed at (1 + write_premium) x price; leave it 0 to ignore write cost.
+    """
     cached_in = min(max(0, cached_in), input_tok)
     uncached_in = input_tok - cached_in
     cost = (
-        (uncached_in / 1e6) * price_in_per_m
+        (uncached_in / 1e6) * price_in_per_m * (1.0 + write_premium)
         + (cached_in / 1e6) * price_in_per_m * cache_discount
         + (output_tok / 1e6) * price_out_per_m
     )
@@ -50,6 +55,47 @@ def discount_stack(
     cache_mult = cache_hit_frac * cache_discount + (1.0 - cache_hit_frac)
     batch_mult = batch_discount if batch else 1.0
     return cache_mult * batch_mult
+
+
+CACHE_WRITE_PREMIUM = 0.25   # Anthropic 5-min cache write = 1.25x base input price
+
+
+def cache_storage_frac(storage_usd_per_m_hr: float, ttl_hours: float, price_in_per_m: float) -> float:
+    """Storage-billed caches (Gemini-style) as a fraction of the prefix's input price.
+
+    Storage is a flat $/1M-token-hour, so on a cheap model it is a big fraction of
+    the input price — caching a small model needs far more reads to pay off.
+    """
+    if price_in_per_m <= 0:
+        return float("inf")
+    return storage_usd_per_m_hr * ttl_hours / price_in_per_m
+
+
+def cache_break_even_reads(
+    write_premium: float = CACHE_WRITE_PREMIUM,
+    read_discount: float = 0.10,
+    storage_cost_frac: float = 0.0,
+) -> float:
+    """Reads per cached prefix at which caching breaks even.
+
+    Writing a prefix costs (write_premium + storage_cost_frac) x its input price
+    once; each read saves (1 - read_discount) x that price. Anthropic defaults:
+    0.25 / 0.90 = 0.28 reads.
+    """
+    saving_per_read = 1.0 - read_discount
+    if saving_per_read <= 0:
+        return float("inf")
+    return (max(0.0, write_premium) + max(0.0, storage_cost_frac)) / saving_per_read
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_premium: float = CACHE_WRITE_PREMIUM,
+    read_discount: float = 0.10,
+    storage_cost_frac: float = 0.0,
+) -> bool:
+    """Caching saves money only if a prefix is re-read more often than break-even."""
+    return avg_cache_reads > cache_break_even_reads(write_premium, read_discount, storage_cost_frac)
 
 
 def break_even_utilization(discount_frac: float) -> float:
